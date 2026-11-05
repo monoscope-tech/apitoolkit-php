@@ -53,6 +53,14 @@ class SharedTest extends TestCase
         $this->assertSame('application/json', $attrs['http.response.header.Content-Type']);
     }
 
+    public function testAcceptsNonRecordingSpanWhenNoSdkIsConfigured(): void
+    {
+        Shared::setAttributes(
+            \OpenTelemetry\API\Trace\Span::getInvalid(), 'example.com', 200, [], [], [], [], 'GET', '/', 'msg', '/', '', '', [], [], 'Test'
+        );
+        $this->assertCount(0, $this->exporter->getSpans());
+    }
+
     public function testRedactsJsonBodies(): void
     {
         $span = $this->tracerProvider->getTracer('test')->spanBuilder('test')->startSpan();

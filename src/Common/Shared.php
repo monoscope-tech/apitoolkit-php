@@ -2,13 +2,8 @@
 
 namespace Apitoolkit\Common;
 
-use OpenTelemetry\SDK\Trace\TracerProvider;
 use OpenTelemetry\API\Globals;
-use OpenTelemetry\Context\ScopeInterface;
-use OpenTelemetry\SDK\Trace\Span;
-use OpenTelemetry\SDK\Trace\SpanExporterInterface;
-use OpenTelemetry\SDK\Trace\SpanProcessorInterface;
-use OpenTelemetry\Trace\SpanInterface;
+use OpenTelemetry\API\Trace\SpanInterface;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
 use GuzzleHttp\Exception\RequestException;
@@ -24,7 +19,7 @@ use JsonPath\InvalidJsonException;
 class Shared {
 
   public static function setAttributes(
-    Span $span,
+    SpanInterface $span,
     string $host,
     int $status_code,
     array $query_params,
