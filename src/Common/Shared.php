@@ -11,10 +11,10 @@ use OpenTelemetry\SDK\Trace\SpanProcessorInterface;
 use OpenTelemetry\Trace\SpanInterface;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
+use GuzzleHttp\Exception\RequestException;
 use GuzzleHttp\HandlerStack;
-use GuzzleHttp\Middleware as GuzzleMiddleware;
 use GuzzleHttp\Psr7\Request;
-use GuzzleHttp\Psr7\Response as GuzzleResponse;
+use GuzzleHttp\Promise\Create;
 use JsonPath\JsonObject;
 use JsonPath\InvalidJsonException;
 
@@ -64,12 +64,11 @@ class Shared {
             "apitoolkit.tags" => json_encode($config['tags'] ?? []),
         ]);
 
-        foreach ($req_headers as $header => $value) {
-            $span->setAttribute("http.request.header.$header", self::redactHeader(self::toString($value), $config['redactHeaders'] ?? []));
-        }
-
-        foreach ($resp_headers as $header => $value) {
-            $span->setAttribute("http.response.header.$header", self::redactHeader(self::toString($value), $config['redactHeaders'] ?? []));
+        $redacted = array_map('strtolower', array_merge($config['redactHeaders'] ?? [], ['authorization', 'cookie', 'set-cookie', 'proxy-authorization']));
+        foreach (['request' => $req_headers, 'response' => $resp_headers] as $kind => $headers) {
+            foreach ($headers as $header => $value) {
+                $span->setAttribute("http.$kind.header.$header", in_array(strtolower($header), $redacted) ? "[CLIENT_REDACTED]" : self::toString($value));
+            }
         }
     } catch (Exception $error) {
         $span->recordException($error);
@@ -80,70 +79,47 @@ class Shared {
 public static function observeGuzzle($options, $msgId)
 {
     $handlerStack = HandlerStack::create();
-    $request_info = [];
-    $span = null;
-    $handlerStack->push(GuzzleMiddleware::mapRequest(function ($request) use (&$request_info, &$span, $options) {
-        $tracerProvider = Globals::tracerProvider();
-        $tracer = $tracerProvider->getTracer("apitoolkit-http-tracer");
-        $span = $tracer->spanBuilder('apitoolkit-http-span')->startSpan();
-        $query = "";
-        parse_str($request->getUri()->getQuery(), $query);
-        $request_info = [
-            "method" => $request->getMethod(),
-            "raw_url" => $request->getUri()->getPath() . '?' . $request->getUri()->getQuery(),
-            "url_no_query" => $request->getUri()->getPath(),
-            "url_path" => $options['pathPattern'] ?? $request->getUri()->getPath(),
-            "headers" => $request->getHeaders(),
-            "body" => $request->getBody()->getContents(),
-            "query" => $query,
-            "host" => $request->getUri()->getHost(),
-        ];
-        return $request;
-    }));
-
-    $handlerStack->push(GuzzleMiddleware::mapResponse(function ($response) use (&$request_info, &$span, $msgId, $options) {
-        $respBody = $response->getBody()->getContents();
-        try {
-          $host = $request_info["host"];
-          $queryParams = $request_info["query"];
-          $reqHeaders = $request_info["headers"];
-          $method = $request_info["method"];
-          $pathParams = self::extractPathParams($request_info["url_path"], $request_info["url_no_query"]);
-
-          self::setAttributes(
-            $span,
-            $host,
-            $response->getStatusCode(),
-            $queryParams,
-            $pathParams,
-            $reqHeaders,
-            $response->getHeaders(),
-            $method,
-            $request_info["raw_url"],
-            null,
-            $request_info["url_path"],
-            $request_info["body"],
-            $respBody,
-            [],
-            $options,
-            "GuzzleOutgoing",
-            $msgId,
-        );
-
-        } catch (\Throwable $th) {
-          throw $th;
-        }
-
-        $newBodyStream = \GuzzleHttp\Psr7\Utils::streamFor($respBody);
-        $newResponse = new GuzzleResponse(
-            $response->getStatusCode(),
-            $response->getHeaders(),
-            $newBodyStream,
-            $response->getProtocolVersion(),
-            $response->getReasonPhrase()
-        );
-        return $newResponse;
-    }));
+    // One middleware per call, so the span and request details stay per-request and are
+    // still recorded when the request fails before a response arrives (e.g. ConnectException).
+    $handlerStack->push(function (callable $handler) use ($msgId, $options) {
+        return function ($request, array $reqOptions) use ($handler, $msgId, $options) {
+            $span = Globals::tracerProvider()->getTracer("apitoolkit-http-tracer")->spanBuilder('apitoolkit-http-span')->startSpan();
+            $uri = $request->getUri();
+            parse_str($uri->getQuery(), $query);
+            $urlPath = $options['pathPattern'] ?? $uri->getPath();
+            $reqBody = (string) $request->getBody();
+            $record = function ($response, array $errors) use ($span, $request, $uri, $query, $urlPath, $reqBody, $msgId, $options) {
+                $respBody = $response ? (string) $response->getBody() : "";
+                self::setAttributes(
+                    $span,
+                    $uri->getHost(),
+                    $response ? $response->getStatusCode() : 0,
+                    $query,
+                    self::extractPathParams($urlPath, $uri->getPath()),
+                    $request->getHeaders(),
+                    $response ? $response->getHeaders() : [],
+                    $request->getMethod(),
+                    $uri->getPath() . '?' . $uri->getQuery(),
+                    null,
+                    $urlPath,
+                    $reqBody,
+                    $respBody,
+                    $errors,
+                    $options,
+                    "GuzzleOutgoing",
+                    $msgId,
+                );
+                return $respBody;
+            };
+            return $handler($request, $reqOptions)->then(
+                fn($response) => $response->withBody(\GuzzleHttp\Psr7\Utils::streamFor($record($response, []))),
+                function ($reason) use ($record) {
+                    $record($reason instanceof RequestException ? $reason->getResponse() : null, $reason instanceof \Throwable ? [self::buildError($reason)] : []);
+                    return Create::rejectionFor($reason);
+                }
+            );
+        };
+    });
 
     $client = new Client(['handler' => $handlerStack]);
     return $client;
@@ -209,15 +185,6 @@ public static function reportError($error, $client)
 {
     $atError = self::buildError($error);
     $client->addError($atError);
-}
-
-private static function redactHeader(string $header, array $redact_headers): string
-{
-    $lowercase_header = strtolower($header);
-    if (in_array($lowercase_header, array_map('strtolower', $redact_headers)) || in_array($lowercase_header, ["cookies", "authorization"])) {
-        return "[CLIENT_REDACTED]";
-    }
-    return $header;
 }
 
 // redactJSONFields accepts a list of jsonpath's to redact, and a json object to redact from,
